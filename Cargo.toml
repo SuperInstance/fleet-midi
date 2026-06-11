@@ -1,0 +1,8 @@
+[package]
+name = "fleet-midi"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+edition = "2021"
+description = "MIDI message parsing and fleet broadcast for constellation agents"
+
+[dependencies]
