@@ -588,6 +588,8 @@ pub fn decode_event(bytes: &[u8]) -> Option<Event> {
     })
 }
 
+pub mod persist;
+
 /// Stub module retained for backward compatibility with the original scaffold.
 pub mod stub {
     /// Placeholder function returning a greeting.
