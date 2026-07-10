@@ -371,6 +371,132 @@ impl TryFrom<Event> for MidiMessage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1, Task 2: Context frame + "inherit last context" rule
+// ---------------------------------------------------------------------------
+
+/// Spatial-temporal context that events inherit (§5.2/§5.3).
+///
+/// A `Context` frame is broadcast at a low cadence; subsequent events
+/// implicitly reuse it until the next `Context` arrives, just as running
+/// status lets bare MIDI data bytes reuse the last status byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Context {
+    pub vessel_id: u32,
+    pub fix_time: i64,
+    pub lat_e7: i32,
+    pub lon_e7: i32,
+    pub hacc_cm: u16,
+    pub clock_quality: u8,
+}
+
+impl Context {
+    /// Create a new context frame.
+    pub fn new(
+        vessel_id: u32,
+        fix_time: i64,
+        lat_e7: i32,
+        lon_e7: i32,
+        hacc_cm: u16,
+        clock_quality: u8,
+    ) -> Self {
+        Self {
+            vessel_id,
+            fix_time,
+            lat_e7,
+            lon_e7,
+            hacc_cm,
+            clock_quality,
+        }
+    }
+}
+
+/// Byte length of a serialized [`Context`] frame in an event payload.
+const CONTEXT_PAYLOAD_LEN: usize = 23;
+
+impl Event {
+    /// If this event is a Context frame (`event_type == event_types::CONTEXT`),
+    /// return the embedded [`Context`].
+    pub fn as_context(&self) -> Option<Context> {
+        if self.event_type != event_types::CONTEXT {
+            return None;
+        }
+        if self.payload_len as usize != CONTEXT_PAYLOAD_LEN {
+            return None;
+        }
+        let b = &self.payload;
+        let vessel_id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        let fix_time = i64::from_be_bytes([
+            b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11],
+        ]);
+        let lat_e7 = i32::from_be_bytes([b[12], b[13], b[14], b[15]]);
+        let lon_e7 = i32::from_be_bytes([b[16], b[17], b[18], b[19]]);
+        let hacc_cm = u16::from_be_bytes([b[20], b[21]]);
+        let clock_quality = b[22];
+        Some(Context {
+            vessel_id,
+            fix_time,
+            lat_e7,
+            lon_e7,
+            hacc_cm,
+            clock_quality,
+        })
+    }
+
+    /// Build a Context event from a [`Context`].
+    pub fn from_context(ctx: Context, event_time: i64, source_id: u16, seq: u32) -> Self {
+        let mut ev = Event::new(event_types::CONTEXT, event_time, source_id, seq);
+        let v = ctx.vessel_id.to_be_bytes();
+        let f = ctx.fix_time.to_be_bytes();
+        let lat = ctx.lat_e7.to_be_bytes();
+        let lon = ctx.lon_e7.to_be_bytes();
+        let h = ctx.hacc_cm.to_be_bytes();
+        ev.set_payload(&[
+            v[0], v[1], v[2], v[3], f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], lat[0],
+            lat[1], lat[2], lat[3], lon[0], lon[1], lon[2], lon[3], h[0], h[1],
+            ctx.clock_quality,
+        ]);
+        ev
+    }
+}
+
+/// Router state that tracks the last broadcast [`Context`] for inherited
+/// event attribution.
+#[derive(Debug, Default, Clone)]
+pub struct EventRouter {
+    last_context: Option<Context>,
+}
+
+impl EventRouter {
+    /// Create a router with no inherited context.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Process a Context frame, updating the inherited context.
+    pub fn broadcast_context(&mut self, ctx: Context) {
+        self.last_context = Some(ctx);
+    }
+
+    /// Process an event, updating inherited context if the event itself is a
+    /// Context frame, and returning the context that applies to the event.
+    ///
+    /// Events received before any Context has been seen return `None`;
+    /// callers should treat this as "no position/clock attribution yet"
+    /// rather than an error.
+    pub fn handle_event(&mut self, event: &Event) -> Option<Context> {
+        if let Some(ctx) = event.as_context() {
+            self.last_context = Some(ctx);
+        }
+        self.last_context
+    }
+
+    /// Return the currently inherited context without processing an event.
+    pub fn current_context(&self) -> Option<Context> {
+        self.last_context
+    }
+}
+
 /// Stub module retained for backward compatibility with the original scaffold.
 pub mod stub {
     /// Placeholder function returning a greeting.
@@ -665,5 +791,84 @@ mod tests {
             MidiMessage::try_from(ev).unwrap_err(),
             MidiConversionError::NotMidiEventType(event_types::CONTEXT)
         );
+    }
+
+    // --- Task 2: Context frame + inherited context ---
+
+    #[test]
+    fn context_event_serializes_and_deserializes() {
+        let ctx = Context::new(
+            42,
+            1_000_000_000_000,
+            600_000_000_i32,
+            -1_200_000_000_i32,
+            150,
+            3,
+        );
+        let ev = Event::from_context(ctx, 1_000_000_000_100, 7, 1);
+        assert_eq!(ev.event_type, event_types::CONTEXT);
+        assert_eq!(ev.event_time, 1_000_000_000_100);
+        assert_eq!(ev.source_id, 7);
+        assert_eq!(ev.seq, 1);
+        assert_eq!(ev.payload_len, CONTEXT_PAYLOAD_LEN as u8);
+        assert_eq!(ev.as_context(), Some(ctx));
+    }
+
+    #[test]
+    fn event_before_any_context_has_no_context() {
+        let mut router = EventRouter::new();
+        let ev = Event::new(event_types::MIDI_NOTE_ON, 100, 5, 1);
+        assert_eq!(router.current_context(), None);
+        assert_eq!(router.handle_event(&ev), None);
+    }
+
+    #[test]
+    fn event_inherits_last_context() {
+        let mut router = EventRouter::new();
+
+        let ctx = Context::new(
+            42,
+            1_000_000_000_000,
+            600_000_000_i32,
+            -1_200_000_000_i32,
+            150,
+            3,
+        );
+        router.broadcast_context(ctx);
+
+        let ev = Event::new(event_types::MIDI_NOTE_ON, 1_000_000_000_100, 5, 10);
+        let resolved = router.handle_event(&ev);
+        assert_eq!(resolved, Some(ctx));
+        assert_eq!(resolved.unwrap().vessel_id, 42);
+    }
+
+    #[test]
+    fn context_updates_are_inherited_by_later_events() {
+        let mut router = EventRouter::new();
+
+        let ctx1 = Context::new(1, 100, 100_000_000, 200_000_000, 50, 1);
+        router.broadcast_context(ctx1);
+
+        let ev = Event::new(event_types::MIDI_CONTROL_CHANGE, 150, 2, 3);
+        assert_eq!(router.handle_event(&ev), Some(ctx1));
+
+        let ctx2 = Context::new(2, 200, -300_000_000, 400_000_000, 75, 2);
+        router.broadcast_context(ctx2);
+
+        let ev2 = Event::new(event_types::MIDI_NOTE_OFF, 250, 2, 4);
+        assert_eq!(router.handle_event(&ev2), Some(ctx2));
+        assert_ne!(ctx1, ctx2);
+    }
+
+    #[test]
+    fn context_event_also_updates_inherited_context() {
+        let mut router = EventRouter::new();
+
+        let ctx = Context::new(99, 500, 100, 200, 10, 0);
+        let ctx_event = Event::from_context(ctx, 500, 0, 0);
+        assert_eq!(router.handle_event(&ctx_event), Some(ctx));
+
+        let ev = Event::new(event_types::MIDI_PITCH_BEND, 600, 1, 5);
+        assert_eq!(router.handle_event(&ev), Some(ctx));
     }
 }
