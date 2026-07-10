@@ -497,6 +497,97 @@ impl EventRouter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1, Task 3: envelope encoder/decoder with CRC8
+// ---------------------------------------------------------------------------
+
+/// CRC-8 polynomial used for the event envelope.
+///
+/// Parameters: polynomial `x^8 + x^2 + x + 1` (0x07), initial value 0x00,
+/// no input/output reflection, no final XOR.  This catches all single-bit
+/// errors and small burst errors in the short event frames used here.
+const CRC8_POLY: u8 = 0x07;
+
+fn crc8(data: &[u8]) -> u8 {
+    let mut crc: u8 = 0x00;
+    for &byte in data {
+        crc ^= byte;
+        for _ in 0..8 {
+            if crc & 0x80 != 0 {
+                crc = (crc << 1) ^ CRC8_POLY;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+/// Byte length of the fixed envelope header (everything except payload + CRC).
+const EVENT_HEADER_LEN: usize = 17;
+
+/// Encode an [`Event`] into its binary envelope.
+///
+/// Layout (all multi-byte fields big-endian):
+///
+/// ```text
+/// [event_type:2][event_time:8][source_id:2][seq:4][payload_len:1][payload:N][crc8:1]
+/// ```
+pub fn encode_event(ev: &Event) -> Vec<u8> {
+    let payload_len = ev.payload_len as usize;
+    let mut buf = Vec::with_capacity(EVENT_HEADER_LEN + payload_len + 1);
+    buf.extend_from_slice(&ev.event_type.to_be_bytes());
+    buf.extend_from_slice(&ev.event_time.to_be_bytes());
+    buf.extend_from_slice(&ev.source_id.to_be_bytes());
+    buf.extend_from_slice(&ev.seq.to_be_bytes());
+    buf.push(ev.payload_len);
+    buf.extend_from_slice(&ev.payload[..payload_len]);
+    buf.push(crc8(&buf));
+    buf
+}
+
+/// Decode a single [`Event`] from its binary envelope.
+///
+/// Returns `None` if the input is too short, the claimed payload length is
+/// invalid, or the CRC8 check fails.  This function is intentionally
+/// panic-free for any input bytes.
+pub fn decode_event(bytes: &[u8]) -> Option<Event> {
+    if bytes.len() < EVENT_HEADER_LEN + 1 {
+        return None;
+    }
+    let payload_len = bytes[16] as usize;
+    if payload_len > MAX_INLINE_PAYLOAD {
+        return None;
+    }
+    let total_len = EVENT_HEADER_LEN + payload_len + 1;
+    if bytes.len() < total_len {
+        return None;
+    }
+    let frame = &bytes[..total_len - 1];
+    let expected_crc = bytes[total_len - 1];
+    if crc8(frame) != expected_crc {
+        return None;
+    }
+
+    let event_type = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let event_time = i64::from_be_bytes([
+        bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
+    ]);
+    let source_id = u16::from_be_bytes([bytes[10], bytes[11]]);
+    let seq = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let mut payload = [0u8; MAX_INLINE_PAYLOAD];
+    payload[..payload_len].copy_from_slice(&bytes[17..17 + payload_len]);
+
+    Some(Event {
+        event_type,
+        event_time,
+        source_id,
+        seq,
+        payload_len: payload_len as u8,
+        payload,
+    })
+}
+
 /// Stub module retained for backward compatibility with the original scaffold.
 pub mod stub {
     /// Placeholder function returning a greeting.
@@ -870,5 +961,74 @@ mod tests {
 
         let ev = Event::new(event_types::MIDI_PITCH_BEND, 600, 1, 5);
         assert_eq!(router.handle_event(&ev), Some(ctx));
+    }
+
+    // --- Task 3: envelope encoder/decoder + CRC8 safety ---
+
+    #[test]
+    fn event_round_trips_through_binary_envelope() {
+        let mut ev = Event::new(event_types::MIDI_NOTE_ON, 123_456_789, 5, 99);
+        ev.set_payload(&[3, 60, 64]);
+        let bytes = encode_event(&ev);
+        let decoded = decode_event(&bytes).unwrap();
+        assert_eq!(decoded, ev);
+    }
+
+    #[test]
+    fn context_event_round_trips_through_binary_envelope() {
+        let ctx = Context::new(42, 1_000_000_000_000, 600_000_000, -1_200_000_000, 150, 3);
+        let ev = Event::from_context(ctx, 1_000_000_000_100, 7, 1);
+        let bytes = encode_event(&ev);
+        let decoded = decode_event(&bytes).unwrap();
+        assert_eq!(decoded, ev);
+        assert_eq!(decoded.as_context(), Some(ctx));
+    }
+
+    #[test]
+    fn empty_input_decodes_to_none() {
+        assert_eq!(decode_event(&[]), None);
+    }
+
+    #[test]
+    fn truncated_event_decodes_to_none() {
+        let mut ev = Event::new(event_types::MIDI_NOTE_ON, 123_456_789, 5, 99);
+        ev.set_payload(&[3, 60, 64]);
+        let bytes = encode_event(&ev);
+        for len in 0..bytes.len() {
+            assert_eq!(decode_event(&bytes[..len]), None, "len {} should fail", len);
+        }
+    }
+
+    #[test]
+    fn corrupted_byte_is_rejected_by_crc8() {
+        let mut ev = Event::new(event_types::MIDI_CONTROL_CHANGE, 123_456_789, 2, 7);
+        ev.set_payload(&[1, 7, 127]);
+        let mut bytes = encode_event(&ev);
+        // Flip one bit in the payload region.
+        let payload_start = EVENT_HEADER_LEN;
+        bytes[payload_start] ^= 0x01;
+        assert_eq!(decode_event(&bytes), None);
+    }
+
+    #[test]
+    fn oversized_payload_len_is_rejected() {
+        let mut bytes = vec![0u8; EVENT_HEADER_LEN + 1];
+        bytes[EVENT_HEADER_LEN - 1] = 255; // payload_len field
+        assert_eq!(decode_event(&bytes), None);
+    }
+
+    #[test]
+    fn garbage_bytes_do_not_panic() {
+        // Fuzz-style: feed a few adversarial byte patterns and ensure the
+        // decoder never panics and returns None for clearly invalid input.
+        let patterns: Vec<Vec<u8>> = vec![
+            vec![0xFF; 64],
+            vec![0x00; 64],
+            (0u8..=63).collect(),
+            (0u8..=63).rev().collect(),
+        ];
+        for bytes in patterns {
+            let _ = decode_event(&bytes);
+        }
     }
 }
