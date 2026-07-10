@@ -67,34 +67,34 @@ Each MIDI channel maps to a fleet topic. Channel 10 (standard drum channel) migh
 ## Quick Start
 
 ```rust
-use fleet_midi::stub;
+use fleet_midi::{parse_midi_slice, FleetBroadcaster, MidiMessage};
 
 fn main() {
-    println!("{}", stub::hello());
-    // "hello from fleet-midi"
-}
-```
+    // "Note On, Middle C, velocity 64" followed by a matching Note Off.
+    let bytes = [
+        0x90, 60, 64, // status, note, velocity
+        0x80, 60, 32,
+    ];
 
-The crate is currently scaffolded — the parsing state machine, channel router, and broadcast layer are planned. The public API will expose:
+    let messages = parse_midi_slice(&bytes);
+    println!("parsed {} messages", messages.len());
 
-```rust
-// Planned API
-pub fn parse_midi_byte(state: &mut ParserState, byte: u8) -> Option<MidiMessage>;
-pub fn parse_midi_slice(bytes: &[u8]) -> Vec<MidiMessage>;
-pub struct FleetBroadcaster { /* ... */ }
-impl FleetBroadcaster {
-    pub fn subscribe(&mut self, channel: u8, agent_id: &str);
-    pub fn broadcast(&self, msg: &MidiMessage);
+    let mut broadcaster = FleetBroadcaster::new();
+    broadcaster.subscribe(0, "lead-agent");
+    broadcaster.subscribe(10, "drums-agent");
+
+    for msg in &messages {
+        let notified = broadcaster.broadcast(msg);
+        println!("{:?} -> {:?}", msg, notified);
+    }
 }
 ```
 
 ## API
 
-### `stub::hello() -> &'static str`
+### `MidiMessage`
 
-Placeholder returning `"hello from fleet-midi"`. The full MIDI parsing API will replace this once the state machine and router are implemented.
-
-### Planned: `MidiMessage`
+Parsed channel messages emitted by the parser.
 
 ```rust
 pub enum MidiMessage {
@@ -105,6 +105,51 @@ pub enum MidiMessage {
     ProgramChange { channel: u8, program: u8 },
 }
 ```
+
+Note-on messages with `velocity == 0` are normalized to `NoteOff`, matching the conventional MIDI interpretation of a zero-velocity note-on as a note-off event.
+
+### `ParserState`
+
+Byte-level parsing state for a MIDI byte stream. Use it directly when data arrives one byte at a time:
+
+```rust
+use fleet_midi::{parse_midi_byte, ParserState};
+
+let mut state = ParserState::default();
+for byte in [0x90u8, 60, 64] {
+    if let Some(msg) = parse_midi_byte(&mut state, byte) {
+        println!("{:?}", msg);
+    }
+}
+```
+
+### `parse_midi_byte(state: &mut ParserState, byte: u8) -> Option<MidiMessage>`
+
+Feed a single byte into the state machine. Returns `Some(MidiMessage)` once a complete message has been assembled; otherwise returns `None`. Implements running status and tolerates stray data bytes and incomplete messages without panicking.
+
+### `parse_midi_slice(bytes: &[u8]) -> Vec<MidiMessage>`
+
+Parse a complete byte buffer into decoded messages. Incomplete messages at the end of the buffer are silently dropped.
+
+### `FleetBroadcaster`
+
+A simple channel-router for decoded messages.
+
+```rust
+use fleet_midi::{FleetBroadcaster, MidiMessage};
+
+let mut bc = FleetBroadcaster::new();
+bc.subscribe(0, "lead-agent");
+bc.subscribe(0, "visuals-agent");
+bc.subscribe(10, "drums-agent");
+
+let msg = MidiMessage::NoteOn { channel: 0, note: 60, velocity: 64 };
+assert_eq!(bc.broadcast(&msg), vec!["lead-agent", "visuals-agent"]);
+```
+
+### `stub::hello() -> &'static str`
+
+Legacy scaffold placeholder returning `"hello from fleet-midi"`. Retained for backward compatibility; new code should use the MIDI parsing API.
 
 ## Architecture Notes
 
