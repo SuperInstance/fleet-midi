@@ -186,6 +186,191 @@ impl FleetBroadcaster {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1, Task 1: generalized event envelope
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes carried inline in an [`Event`] payload.
+///
+/// Phase 1 caps the inline payload at 32 bytes, which is enough for the
+/// serialized [`Context`] frame (23 bytes) plus a small margin.  The
+/// proposal's full envelope allows up to 255 bytes; that can be widened
+/// later without changing the wire discipline.
+pub const MAX_INLINE_PAYLOAD: usize = 32;
+
+/// Reserved `event_type` values (§5.4).
+pub mod event_types {
+    /// Context frame: vessel + GPS fix + clock anchor.
+    pub const CONTEXT: u16 = 0x0001;
+
+    // 0x0010..=0x00FF are reserved for generalized MIDI-compatible events.
+    /// MIDI Note On.
+    pub const MIDI_NOTE_ON: u16 = 0x0010;
+    /// MIDI Note Off.
+    pub const MIDI_NOTE_OFF: u16 = 0x0011;
+    /// MIDI Control Change.
+    pub const MIDI_CONTROL_CHANGE: u16 = 0x0012;
+    /// MIDI Pitch Bend.
+    pub const MIDI_PITCH_BEND: u16 = 0x0013;
+    /// MIDI Program Change.
+    pub const MIDI_PROGRAM_CHANGE: u16 = 0x0014;
+}
+
+/// A generalized, typed event on the fleet bus.
+///
+/// This is the shared envelope described in the proposal: every event,
+/// regardless of type, carries an `event_type`, a timestamp placeholder,
+/// a source id, a sequence number, and a small bounded inline payload.
+///
+/// `event_time` is a placeholder in Phase 1 (Task 2 attaches real GPS-time
+/// semantics through the inherited [`Context`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    pub event_type: u16,
+    pub event_time: i64,
+    pub source_id: u16,
+    pub seq: u32,
+    pub payload_len: u8,
+    pub payload: [u8; MAX_INLINE_PAYLOAD],
+}
+
+impl Event {
+    /// Create an event with no payload.
+    pub fn new(event_type: u16, event_time: i64, source_id: u16, seq: u32) -> Self {
+        Self {
+            event_type,
+            event_time,
+            source_id,
+            seq,
+            payload_len: 0,
+            payload: [0; MAX_INLINE_PAYLOAD],
+        }
+    }
+
+    /// Return the active slice of the inline payload.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload[..self.payload_len as usize]
+    }
+
+    /// Set the inline payload, truncating to [`MAX_INLINE_PAYLOAD`].
+    pub fn set_payload(&mut self, bytes: &[u8]) {
+        let len = bytes.len().min(MAX_INLINE_PAYLOAD);
+        self.payload_len = len as u8;
+        self.payload[..len].copy_from_slice(&bytes[..len]);
+        self.payload[len..].fill(0);
+    }
+}
+
+impl From<MidiMessage> for Event {
+    fn from(msg: MidiMessage) -> Self {
+        let mut ev = Event::new(0, 0, 0, 0);
+        match msg {
+            MidiMessage::NoteOn {
+                channel,
+                note,
+                velocity,
+            } => {
+                ev.event_type = event_types::MIDI_NOTE_ON;
+                ev.set_payload(&[channel, note, velocity]);
+            }
+            MidiMessage::NoteOff {
+                channel,
+                note,
+                velocity,
+            } => {
+                ev.event_type = event_types::MIDI_NOTE_OFF;
+                ev.set_payload(&[channel, note, velocity]);
+            }
+            MidiMessage::ControlChange {
+                channel,
+                controller,
+                value,
+            } => {
+                ev.event_type = event_types::MIDI_CONTROL_CHANGE;
+                ev.set_payload(&[channel, controller, value]);
+            }
+            MidiMessage::PitchBend { channel, value } => {
+                ev.event_type = event_types::MIDI_PITCH_BEND;
+                let lsb = (value & 0x7F) as u8;
+                let msb = ((value >> 7) & 0x7F) as u8;
+                ev.set_payload(&[channel, lsb, msb]);
+            }
+            MidiMessage::ProgramChange { channel, program } => {
+                ev.event_type = event_types::MIDI_PROGRAM_CHANGE;
+                ev.set_payload(&[channel, program]);
+            }
+        }
+        ev
+    }
+}
+
+/// Errors when converting an [`Event`] back into a [`MidiMessage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MidiConversionError {
+    NotMidiEventType(u16),
+    PayloadTooShort { expected: u8, got: u8 },
+}
+
+impl TryFrom<Event> for MidiMessage {
+    type Error = MidiConversionError;
+
+    fn try_from(ev: Event) -> Result<Self, Self::Error> {
+        let need = |n| {
+            if ev.payload_len >= n {
+                Ok(())
+            } else {
+                Err(MidiConversionError::PayloadTooShort {
+                    expected: n,
+                    got: ev.payload_len,
+                })
+            }
+        };
+        let b = &ev.payload;
+        match ev.event_type {
+            event_types::MIDI_NOTE_ON => {
+                need(3)?;
+                Ok(MidiMessage::NoteOn {
+                    channel: b[0],
+                    note: b[1],
+                    velocity: b[2],
+                })
+            }
+            event_types::MIDI_NOTE_OFF => {
+                need(3)?;
+                Ok(MidiMessage::NoteOff {
+                    channel: b[0],
+                    note: b[1],
+                    velocity: b[2],
+                })
+            }
+            event_types::MIDI_CONTROL_CHANGE => {
+                need(3)?;
+                Ok(MidiMessage::ControlChange {
+                    channel: b[0],
+                    controller: b[1],
+                    value: b[2],
+                })
+            }
+            event_types::MIDI_PITCH_BEND => {
+                need(3)?;
+                let value = ((b[2] as u16) << 7) | (b[1] as u16);
+                Ok(MidiMessage::PitchBend {
+                    channel: b[0],
+                    value,
+                })
+            }
+            event_types::MIDI_PROGRAM_CHANGE => {
+                need(2)?;
+                Ok(MidiMessage::ProgramChange {
+                    channel: b[0],
+                    program: b[1],
+                })
+            }
+            other => Err(MidiConversionError::NotMidiEventType(other)),
+        }
+    }
+}
+
 /// Stub module retained for backward compatibility with the original scaffold.
 pub mod stub {
     /// Placeholder function returning a greeting.
@@ -400,5 +585,85 @@ mod tests {
     #[test]
     fn stub_hello_still_works() {
         assert_eq!(stub::hello(), "hello from fleet-midi");
+    }
+
+    // --- Task 1: Event envelope + MIDI compatibility ---
+
+    #[test]
+    fn midi_note_on_round_trips_through_event() {
+        let msg = MidiMessage::NoteOn {
+            channel: 3,
+            note: 60,
+            velocity: 64,
+        };
+        let ev: Event = msg.clone().into();
+        assert_eq!(ev.event_type, event_types::MIDI_NOTE_ON);
+        assert_eq!(ev.event_time, 0);
+        assert_eq!(ev.source_id, 0);
+        assert_eq!(ev.payload_len, 3);
+        assert_eq!(ev.payload()[..], [3, 60, 64]);
+        let back: MidiMessage = ev.try_into().unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn midi_note_off_round_trips_through_event() {
+        let msg = MidiMessage::NoteOff {
+            channel: 5,
+            note: 48,
+            velocity: 32,
+        };
+        let ev: Event = msg.clone().into();
+        assert_eq!(ev.event_type, event_types::MIDI_NOTE_OFF);
+        assert_eq!(ev.payload()[..], [5, 48, 32]);
+        let back: MidiMessage = ev.try_into().unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn midi_control_change_round_trips_through_event() {
+        let msg = MidiMessage::ControlChange {
+            channel: 2,
+            controller: 1,
+            value: 127,
+        };
+        let ev: Event = msg.clone().into();
+        assert_eq!(ev.event_type, event_types::MIDI_CONTROL_CHANGE);
+        let back: MidiMessage = ev.try_into().unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn midi_pitch_bend_round_trips_through_event() {
+        let msg = MidiMessage::PitchBend {
+            channel: 4,
+            value: 0x0934,
+        };
+        let ev: Event = msg.clone().into();
+        assert_eq!(ev.event_type, event_types::MIDI_PITCH_BEND);
+        assert_eq!(ev.payload()[..], [4, 0x34, 0x12]);
+        let back: MidiMessage = ev.try_into().unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn midi_program_change_round_trips_through_event() {
+        let msg = MidiMessage::ProgramChange {
+            channel: 7,
+            program: 42,
+        };
+        let ev: Event = msg.clone().into();
+        assert_eq!(ev.event_type, event_types::MIDI_PROGRAM_CHANGE);
+        let back: MidiMessage = ev.try_into().unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn non_midi_event_does_not_convert_to_midi() {
+        let ev = Event::new(event_types::CONTEXT, 0, 0, 0);
+        assert_eq!(
+            MidiMessage::try_from(ev).unwrap_err(),
+            MidiConversionError::NotMidiEventType(event_types::CONTEXT)
+        );
     }
 }
