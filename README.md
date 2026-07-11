@@ -4,7 +4,7 @@
 
 ## Why It Matters
 
-MIDI is the most successful binary protocol in history: every electronic keyboard, every DAW (Digital Audio Workstation), every film scoring tool speaks it. Its design is remarkably efficient — a "Note On, Middle C, velocity 64" takes exactly 3 bytes. This efficiency makes MIDI attractive far beyond music: robotics control, lighting systems, and live coding environments all repurpose MIDI as a low-latency signaling layer.
+MIDI is one of the longest-lived and most widely deployed binary protocols in computing: every electronic keyboard, every DAW (Digital Audio Workstation), every film scoring tool speaks it. Its design is efficient — a "Note On, Middle C, velocity 64" takes exactly 3 bytes. This efficiency makes MIDI attractive far beyond music: robotics control, lighting systems, and live coding environments all repurpose MIDI as a low-latency signaling layer.
 
 In a fleet context, MIDI provides something HTTP and gRPC cannot: **sub-millisecond, fire-and-forget event delivery**. A MIDI message from a controller arrives in under 1ms. Translating that into fleet actions — agent wakeups, parameter sweeps, visual cues — requires a parser that understands the wire format and can route decoded events to the right subscriber. That is what this crate provides.
 
@@ -90,6 +90,10 @@ fn main() {
 }
 ```
 
+## Testing & CI
+
+The crate includes 12 unit tests covering message parsing, running-status reuse, velocity-zero normalization, stray-data-byte tolerance, and channel-routed broadcast. GitHub Actions CI runs `cargo build` and `cargo test` on every push to `master` and `production-round3-2026-07-10`.
+
 ## API
 
 ### `MidiMessage`
@@ -155,7 +159,13 @@ Legacy scaffold placeholder returning `"hello from fleet-midi"`. Retained for ba
 
 Fleet MIDI provides a **real-time sensory channel** for the SuperInstance constellation. In the conservation law **γ + η = C**, MIDI events are a form of η (η脉冲, pulse energy) — short, sharp impulses that perturb agent state without sustained computation. A drummer's kick drum becomes a fleet-wide synchronization pulse; a knob turn becomes a parameter sweep across all agents.
 
-The crate is designed to integrate with the PLATO room architecture, where MIDI events from a physical controller in one room can trigger agent responses in another. See the [SuperInstance Architecture](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for how real-time input streams flow through the fleet.
+The crate is designed to integrate with the PLATO room architecture, where MIDI events from a physical controller in one room can trigger agent responses in another. See the [SuperInstance Architecture](https://github.com/SuperInstance/superinstance-architecture) for how real-time input streams flow through the fleet.
+
+## Related Repos
+
+- [fleet-conductor](https://github.com/SuperInstance/fleet-conductor) — in-memory orchestration core (AgentState FSM, conservation guard); MIDI events broadcast by this crate would feed into conductor's agent state transitions.
+- [plato-edge](https://github.com/SuperInstance/plato-edge) — PLATO room architecture referenced above as the integration target for physical MIDI controller input.
+- [nexus-edge-runtime](https://github.com/SuperInstance/nexus-edge-runtime) — sensor fusion and fleet coordination runtime; MIDI is another real-time input stream alongside sensor data.
 
 ## References
 
@@ -165,4 +175,4 @@ The crate is designed to integrate with the PLATO room architecture, where MIDI 
 
 ## License
 
-MIT
+MIT OR Apache-2.0 (per `Cargo.toml`)
