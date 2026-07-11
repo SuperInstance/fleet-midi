@@ -4,7 +4,7 @@
 
 ## Why It Matters
 
-MIDI is the most successful binary protocol in history: every electronic keyboard, every DAW (Digital Audio Workstation), every film scoring tool speaks it. Its design is remarkably efficient — a "Note On, Middle C, velocity 64" takes exactly 3 bytes. This efficiency makes MIDI attractive far beyond music: robotics control, lighting systems, and live coding environments all repurpose MIDI as a low-latency signaling layer.
+MIDI is one of the longest-lived and most widely deployed binary protocols in computing: every electronic keyboard, every DAW (Digital Audio Workstation), every film scoring tool speaks it. Its design is efficient — a "Note On, Middle C, velocity 64" takes exactly 3 bytes. This efficiency makes MIDI attractive far beyond music: robotics control, lighting systems, and live coding environments all repurpose MIDI as a low-latency signaling layer.
 
 In a fleet context, MIDI provides something HTTP and gRPC cannot: **sub-millisecond, fire-and-forget event delivery**. A MIDI message from a controller arrives in under 1ms. Translating that into fleet actions — agent wakeups, parameter sweeps, visual cues — requires a parser that understands the wire format and can route decoded events to the right subscriber. That is what this crate provides.
 
@@ -89,6 +89,21 @@ fn main() {
     }
 }
 ```
+
+## Testing & CI
+
+The crate includes 44 tests: 12 covering MIDI message parsing (running-status
+reuse, velocity-zero normalization, stray-data-byte tolerance, channel-routed
+broadcast), 18 covering the generalized Event/Context envelope and binary
+codec (Phase 1), and 14 covering the DuckDB/Parquet persistence layer,
+including the tolerance-window synoptic query (Phase 2). GitHub Actions CI
+runs `cargo build` and `cargo test` on every push.
+
+## Related Repos
+
+- [fleet-conductor](https://github.com/SuperInstance/fleet-conductor) — in-memory orchestration core (AgentState FSM, conservation guard, and — as of its own next-level pass — a real TCP server); MIDI/event-bus messages from this crate are a natural input to conductor's agent state transitions.
+- [plato-edge](https://github.com/SuperInstance/plato-edge) — PLATO room architecture; a natural integration target for physical MIDI controller input triggering agent responses in another room.
+- [nexus-edge-runtime](https://github.com/SuperInstance/nexus-edge-runtime) — sensor fusion, wire protocol, and fleet coordination runtime; MIDI/event-bus data is another real-time input stream alongside its sensor fusion module.
 
 ## API
 
@@ -286,4 +301,4 @@ The crate is designed to integrate with the PLATO room architecture, where MIDI 
 
 ## License
 
-MIT
+MIT OR Apache-2.0 (per `Cargo.toml`)
