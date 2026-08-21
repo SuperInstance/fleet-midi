@@ -6,3 +6,5 @@ edition = "2021"
 description = "MIDI message parsing and fleet broadcast for constellation agents"
 
 [dependencies]
+arrow = { version = "58.3.0", default-features = false }
+parquet = { version = "58.3.0", default-features = false, features = ["arrow"] }

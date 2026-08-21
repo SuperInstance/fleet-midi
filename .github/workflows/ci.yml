@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [master, production-round3-2026-07-10]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --verbose
+      - name: Test
+        run: cargo test --verbose
