@@ -4,7 +4,7 @@
 
 ## Why It Matters
 
-MIDI is the most successful binary protocol in history: every electronic keyboard, every DAW (Digital Audio Workstation), every film scoring tool speaks it. Its design is remarkably efficient — a "Note On, Middle C, velocity 64" takes exactly 3 bytes. This efficiency makes MIDI attractive far beyond music: robotics control, lighting systems, and live coding environments all repurpose MIDI as a low-latency signaling layer.
+MIDI is one of the longest-lived and most widely deployed binary protocols in computing: every electronic keyboard, every DAW (Digital Audio Workstation), every film scoring tool speaks it. Its design is efficient — a "Note On, Middle C, velocity 64" takes exactly 3 bytes. This efficiency makes MIDI attractive far beyond music: robotics control, lighting systems, and live coding environments all repurpose MIDI as a low-latency signaling layer.
 
 In a fleet context, MIDI provides something HTTP and gRPC cannot: **sub-millisecond, fire-and-forget event delivery**. A MIDI message from a controller arrives in under 1ms. Translating that into fleet actions — agent wakeups, parameter sweeps, visual cues — requires a parser that understands the wire format and can route decoded events to the right subscriber. That is what this crate provides.
 
@@ -90,6 +90,21 @@ fn main() {
 }
 ```
 
+## Testing & CI
+
+The crate includes 44 tests: 12 covering MIDI message parsing (running-status
+reuse, velocity-zero normalization, stray-data-byte tolerance, channel-routed
+broadcast), 18 covering the generalized Event/Context envelope and binary
+codec (Phase 1), and 14 covering the DuckDB/Parquet persistence layer,
+including the tolerance-window synoptic query (Phase 2). GitHub Actions CI
+runs `cargo build` and `cargo test` on every push.
+
+## Related Repos
+
+- [fleet-conductor](https://github.com/SuperInstance/fleet-conductor) — in-memory orchestration core (AgentState FSM, conservation guard, and — as of its own next-level pass — a real TCP server); MIDI/event-bus messages from this crate are a natural input to conductor's agent state transitions.
+- [plato-edge](https://github.com/SuperInstance/plato-edge) — PLATO room architecture; a natural integration target for physical MIDI controller input triggering agent responses in another room.
+- [nexus-edge-runtime](https://github.com/SuperInstance/nexus-edge-runtime) — sensor fusion, wire protocol, and fleet coordination runtime; MIDI/event-bus data is another real-time input stream alongside its sensor fusion module.
+
 ## API
 
 ### `MidiMessage`
@@ -151,6 +166,127 @@ assert_eq!(bc.broadcast(&msg), vec!["lead-agent", "visuals-agent"]);
 
 Legacy scaffold placeholder returning `"hello from fleet-midi"`. Retained for backward compatibility; new code should use the MIDI parsing API.
 
+## Phase 2: Local Parquet Persistence (`fleet_midi::persist`)
+
+Phase 2 adds a **durable Tier-2 store** on top of the Phase 1 real-time bus.
+Events decoded through the Phase 1 binary envelope (`encode_event` /
+`decode_event`) are persisted as rows in **genuine Parquet files** on disk,
+partitioned one file per `(vessel, hour)`, plus a `vessels`/`sources`
+registry. The tolerance-window query implements the §5.5 synoptic pattern:
+"latest reading per source within ±2 seconds."
+
+### Design decision: pure-Rust Parquet instead of bundled DuckDB
+
+The proposal recommends DuckDB + Parquet as the primary durable store. In this
+development sandbox (~3.5 GB RAM), DuckDB's Rust bindings (`duckdb` crate with
+the `bundled` feature, which compiles the full C++ library) peaked at 3.3 GB
+and was killed before completing. The `duckdb` CLI binary is not available
+here either.
+
+We therefore use the **pure-Rust `parquet` + `arrow` crates** to write real,
+valid Parquet files — the critical property for the design (a boat rsyncs
+finished Parquet files; a future cloud DuckDB reads them with
+`SELECT * FROM 'events.parquet'`) — and implement the tolerance-window query
+logic in Rust. The on-disk format is genuine Parquet; only the local query
+engine differs from the proposal's ideal. If DuckDB becomes practical (more
+RAM, or a pre-built binary), the query layer can be swapped without changing
+any persisted files.
+
+### Storage layout
+
+```
+<base_dir>/
+  data/
+    vessel=<id>/
+      hour=<unix_hour>/
+        events.parquet
+  registry/
+    vessels.parquet
+    sources.parquet
+```
+
+Each `events.parquet` partition contains rows with this schema (§5.3):
+
+| Column | Type | Source |
+|---|---|---|
+| `vessel_id` | `UInt32` | Context |
+| `event_type` | `UInt16` | Event |
+| `event_time` | `Int64` | Event (ns since GPS epoch) |
+| `source_id` | `UInt16` | Event |
+| `seq` | `UInt32` | Event (per-source monotonic) |
+| `fix_time` | `Int64` | Context (ns since GPS epoch) |
+| `lat_e7` | `Int32` | Context (deg × 1e7, ~11 mm resolution) |
+| `lon_e7` | `Int32` | Context |
+| `hacc_cm` | `UInt16` | Context (horizontal accuracy, cm) |
+| `clock_quality` | `UInt8` | Context (0=dead-reckon … 3=GPS-PPS locked) |
+
+The `vessels` and `sources` registries are separate Parquet files containing
+`(vessel_id, name)` and `(source_id, vessel_id, name)` rows respectively. This
+keeps everything as plain files — no server, no database process — consistent
+with the edge-native, offline-first design.
+
+### Quick start
+
+```rust
+use fleet_midi::persist::{EventStore, DEFAULT_TOLERANCE_NS, persisted_event_types};
+use fleet_midi::{Event, Context, encode_event, decode_event};
+
+let mut store = EventStore::open("/data/fleet").unwrap();
+store.register_vessel(42, "F/V Aurora");
+
+let ctx = Context::new(42, 1_000_000_000_000_000_000, 600_000_000, -1_200_000_000, 150, 3);
+
+// Persist an event through the real Phase 1 wire path.
+let ev = Event::new(persisted_event_types::SCALAR_READING, 1_000_000_000_100_000, 1, 1);
+let decoded = decode_event(&encode_event(&ev)).unwrap();
+store.persist(&decoded, ctx);
+store.flush().unwrap();
+
+// "Latest reading per source within ±2 seconds" (§5.5 tolerance window).
+let results = store.query_latest_within_tolerance(
+    1_000_000_000_100_000,
+    DEFAULT_TOLERANCE_NS,
+    None,
+);
+for event in &results {
+    println!("source {} at {}: lat={:.7}, lon={:.7}",
+             event.source_id, event.event_time,
+             event.lat_e7 as f64 / 1e7, event.lon_e7 as f64 / 1e7);
+}
+```
+
+### Tolerance-window query semantics
+
+Since sources don't share a wall clock (§5.5), `query_latest_within_tolerance`
+finds the **nearest** reading per `(source_id, event_type)` within the window,
+not an exact-timestamp match. The boundary is **inclusive**: an event at
+exactly ±tolerance is included; an event 1 ns beyond is excluded. Ties (two
+events equidistant from the target) are broken by preferring the later
+`event_time`.
+
+### What's implemented
+
+- ✅ `EventStore`: buffer → flush → Parquet, partitioned by `(vessel, hour)`
+- ✅ Read-merge-write append to existing partition files
+- ✅ `vessels`/`sources` registry as separate Parquet files (reloadable)
+- ✅ Tolerance-window synoptic query (§5.5) with inclusive boundary
+- ✅ Event-type filtering (`SCALAR_READING`, `BITE_TRIGGER`, etc.)
+- ✅ Auto-registration of vessels seen via Context frames
+
+### 🔮 Out of scope (per proposal Phase 2–3)
+
+These are explicitly deferred to later phases per the proposal's own roadmap:
+
+- 🔮 **Blob storage** for large payloads (camera footage, dense arrays) — the
+  `BlobRef` manifest schema is designed (§5.3) but not implemented
+- 🔮 **TileDB spike** for dense signal arrays (radar, depth-sounder waveforms)
+  — the proposal recommends deciding this on benchmark evidence, not preference
+- 🔮 **Fleet sync** — uploading finished Parquet partitions over Starlink,
+  `clock_offset` reconciliation, cross-vessel merge
+- 🔮 **Cloud aggregation** — DuckDB/Parquet union queries at fleet scale, or
+  migration to TimescaleDB/PostGIS if rich geo-SQL is needed
+- 🔮 **Geohash/H3 spatial column** for efficient geo-predicates in Parquet scans
+
 ## Architecture Notes
 
 Fleet MIDI provides a **real-time sensory channel** for the SuperInstance constellation. In the conservation law **γ + η = C**, MIDI events are a form of η (η脉冲, pulse energy) — short, sharp impulses that perturb agent state without sustained computation. A drummer's kick drum becomes a fleet-wide synchronization pulse; a knob turn becomes a parameter sweep across all agents.
@@ -165,4 +301,4 @@ The crate is designed to integrate with the PLATO room architecture, where MIDI 
 
 ## License
 
-MIT
+MIT OR Apache-2.0 (per `Cargo.toml`)
